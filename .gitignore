@@ -1,0 +1,3 @@
+# Build output: ./build.sh recreates it.
+HiDPI.app/
+.DS_Store
