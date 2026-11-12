@@ -1,14 +1,18 @@
 // HiDPI: sharp (2x) scaled resolutions above what macOS offers on the built-in display.
-// Creates a virtual HiDPI display and mirrors the built-in screen to it.
+// Two ways, picked per width:
+//   native:   the display's own 2x mode, if macOS has one. Full height including the area beside the notch
+//             (or 16:10 below it, by the menu's "Full height" switch), no extra process. macOS only has these after the override file is installed (--override).
+//   mirrored: otherwise, a virtual HiDPI display that the built-in screen mirrors. Always 16:10, below the notch.
 //
 // build:  ./build.sh   (makes HiDPI.app and installs it to ~/Applications)
 // app:    open HiDPI.app, pick a resolution from the menu bar icon. Normal or Quit reverts.
-//         The choice is remembered. The menu also has Custom, Full height, Toggle (Ctrl-Opt-Cmd-H)
-//         and Start at login.
-// cli:    HiDPI 2048 [height]   (Ctrl-C reverts; height defaults to 16:10, clear of the notch)
-//         HiDPI --child 2048 [height]  (what the app runs: as above, but exits when the app dies)
-//         HiDPI --probe 2048    (self-check: creates the display without mirroring, then exits;
-//                               the 2x check itself only runs on a real switch)
+//         The choice is remembered. The menu also has Custom, Toggle (Ctrl-Opt-Cmd-H) and Start at login.
+// cli:    HiDPI --sizes         (self-check: which menu sizes are native and which would be mirrored)
+//         HiDPI --override <dir>  (writes the override file that makes the menu sizes native, and how to install it)
+//         HiDPI 2048            (mirrors at 2048 x 1280 until Ctrl-C)
+//         HiDPI --child 2048    (what the app runs for a mirrored size: as above, but exits when the app dies)
+//         HiDPI --probe 2048    (self-check for mirroring: creates the virtual display without mirroring, then
+//                               exits; the 2x check itself only runs on a real switch)
 //         HiDPI --login on|off|status   (Start at login for the installed app)
 //         HiDPI --icon <dir>    (writes the app icon as an iconset; build.sh uses it)
 #import <Cocoa/Cocoa.h>
@@ -66,17 +70,45 @@ static CGDirectDisplayID builtinDisplay(void) {
   return kCGNullDirectDisplay;
 }
 
-// 16:10 clears the notch. Full height uses the panel's own aspect ratio, so the strip beside the notch is used too.
-static size_t heightFor(size_t w, BOOL full) {
+static NSArray *modesOf(CGDirectDisplayID d) {
+  return CFBridgingRelease(CGDisplayCopyAllDisplayModes(d, (__bridge CFDictionaryRef) @{(__bridge id)kCGDisplayShowDuplicateLowResolutionModes : @YES}));
+}
+
+// The built-in display's own 2x mode for a width, or NULL if macOS has none (then the width is mirrored).
+// A notched display has two per width: the whole panel including the area beside the notch (`full`), and a
+// 16:10 one below the notch. Of equals, the highest refresh rate. The caller releases it.
+static CGDisplayModeRef nativeMode(size_t w, BOOL full) {
   CGDirectDisplayID b = builtinDisplay();
-  CFArrayRef modes = b && full ? CGDisplayCopyAllDisplayModes(b, (__bridge CFDictionaryRef) @{(__bridge id)kCGDisplayShowDuplicateLowResolutionModes : @YES}) : NULL;
-  size_t nw = 0, nh = 0;  // the panel's native size: its largest native-flagged mode (scaled modes can have more pixels)
-  for (CFIndex i = 0; modes && i < CFArrayGetCount(modes); i++) {
-    CGDisplayModeRef m = (CGDisplayModeRef)CFArrayGetValueAtIndex(modes, i);
-    if ((CGDisplayModeGetIOFlags(m) & kDisplayModeNativeFlag) && CGDisplayModeGetPixelWidth(m) > nw) { nw = CGDisplayModeGetPixelWidth(m); nh = CGDisplayModeGetPixelHeight(m); }
+  CGDisplayModeRef best = NULL;
+  for (id o in b ? modesOf(b) : @[]) {
+    CGDisplayModeRef m = (__bridge CGDisplayModeRef)o;
+    if (CGDisplayModeGetWidth(m) != w || CGDisplayModeGetPixelWidth(m) != 2 * w) continue;
+    size_t h = CGDisplayModeGetHeight(m), bh = best ? CGDisplayModeGetHeight(best) : 0;
+    BOOL better = !best || (full ? h > bh : h < bh);
+    if (better || (h == bh && CGDisplayModeGetRefreshRate(m) > CGDisplayModeGetRefreshRate(best))) best = m;
   }
-  if (modes) CFRelease(modes);
-  return nw ? (size_t)lround((double)w * nh / nw) : w * 10 / 16;
+  return best ? CGDisplayModeRetain(best) : NULL;
+}
+
+// A mirrored picture is always 16:10: macOS shows it in the 16:10 area below the notch and never in the strip
+// beside it (a virtual display has no notch), so any other shape only adds bars or gets squashed.
+static size_t mirroredHeight(size_t w) { return w * 10 / 16; }
+
+// The height a pick of this width gives.
+static size_t heightFor(size_t w, BOOL full) {
+  CGDisplayModeRef m = nativeMode(w, full);
+  size_t h = m ? CGDisplayModeGetHeight(m) : mirroredHeight(w);
+  CGDisplayModeRelease(m);
+  return h;
+}
+
+// Switches the built-in display to one of its own modes. AppOnly, like mirror() below: it lasts while this
+// process runs and reverts by itself when it exits.
+static CGError setMode(CGDisplayModeRef m) {
+  CGDisplayConfigRef cfg;
+  CGBeginDisplayConfiguration(&cfg);
+  CGConfigureDisplayWithDisplayMode(cfg, builtinDisplay(), m, NULL);
+  return CGCompleteDisplayConfiguration(cfg, kCGConfigureForAppOnly);
 }
 
 // AppOnly: the configuration also reverts by itself when this process exits.
@@ -145,8 +177,9 @@ static NSString *apply(size_t w, size_t h, BOOL doMirror, unsigned serial) {
 
 @interface App : NSObject <NSApplicationDelegate, NSMenuDelegate>
 @property(strong) NSStatusItem *item;
-@property(strong) NSTask *helper;  // this same binary in --child mode, holding the current resolution
-@property(strong) NSDate *helperStart;
+@property(strong) NSTask *helper;  // a mirrored size: this same binary in --child mode, holding it
+@property(nonatomic) BOOL native;  // a native size: the display is on one of its own modes, nothing else runs
+@property(strong) NSDate *started;
 @property(strong) NSMenuItem *customItem;  // the saved custom width, hidden when it is a preset or unset
 @property(nonatomic) NSInteger wanted;  // width the user wants; 0 = Normal. reconcile makes reality match.
 @property(nonatomic) int restarts;
@@ -173,7 +206,7 @@ static OSStatus hotKeyPressed(EventHandlerCallRef next, EventRef event, void *ap
   self.customItem = [self addTo:menu title:@"" action:@selector(pick:) tag:0];
   [self addTo:menu title:@"Custom…" action:@selector(custom) tag:0];
   [menu addItem:NSMenuItem.separatorItem];
-  [self addTo:menu title:@"Full height (uses the notch strip)" action:@selector(toggleFullHeight) tag:0];
+  [self addTo:menu title:@"Full height (uses the notch area)" action:@selector(toggleNotch) tag:0];
   NSMenuItem *t = [self addTo:menu title:@"Toggle on/off" action:@selector(toggle) tag:0];
   t.keyEquivalent = @"h";
   t.keyEquivalentModifierMask = NSEventModifierFlagControl | NSEventModifierFlagOption | NSEventModifierFlagCommand;
@@ -208,8 +241,8 @@ static OSStatus hotKeyPressed(EventHandlerCallRef next, EventRef event, void *ap
 
 // Titles, ticks and the status item all follow from the state, so every change just calls this.
 - (void)refresh {
-  BOOL full = [prefs() boolForKey:@"fullHeight"];
   NSInteger custom = [prefs() integerForKey:@"customWidth"];
+  BOOL full = self.fullHeight;
   BOOL preset = NO;
   for (size_t i = 0; i < sizeof kWidths / sizeof *kWidths; i++) preset |= (NSInteger)kWidths[i] == custom;
   self.customItem.tag = custom;
@@ -219,7 +252,7 @@ static OSStatus hotKeyPressed(EventHandlerCallRef next, EventRef event, void *ap
       size_t w = (size_t)i.tag;
       if (w) i.title = [NSString stringWithFormat:@"%@%zu × %zu", i == self.customItem ? @"Custom: " : @"", w, heightFor(w, full)];
       i.state = (NSInteger)w == self.wanted && !i.hidden;
-    } else if (i.action == @selector(toggleFullHeight)) {
+    } else if (i.action == @selector(toggleNotch)) {
       i.state = full;
     } else if (i.action == @selector(toggleLogin)) {
       i.state = [SMAppService mainAppService].status == SMAppServiceStatusEnabled;
@@ -230,17 +263,23 @@ static OSStatus hotKeyPressed(EventHandlerCallRef next, EventRef event, void *ap
 
 - (void)menuNeedsUpdate:(NSMenu *)menu { [self refresh]; }
 
-- (void)stopHelper {
+// Back to the resolution set in System Settings, whichever way we left it.
+- (void)revert {
   NSTask *t = self.helper;
   self.helper = nil;  // cleared first, so the termination handler knows we stopped it
   [t terminate];  // the screen reverts when the helper dies
   [t waitUntilExit];
+  // The mirror takes a moment to dissolve, and until then the display is in a transient mode.
+  for (int i = 0; t && i < 30 && CGDisplayIsInMirrorSet(builtinDisplay()); i++) usleep(100000);
+  if (self.native) CGRestorePermanentDisplayConfiguration();
+  self.native = NO;
 }
 
 - (BOOL)healthy {
   CGDirectDisplayID b = builtinDisplay();
-  // "In a mirror set", not "mirrors X": while the display sleeps, CGDisplayMirrorsDisplay reports 0 for an intact mirror.
-  return b && CGDisplayIsInMirrorSet(b) && (NSInteger)pixelWidth(b) == 2 * self.wanted;
+  // A mirrored size is in a mirror set and a native one is not. "In a mirror set", not "mirrors X":
+  // while the display sleeps, CGDisplayMirrorsDisplay reports 0 for an intact mirror.
+  return b && !CGDisplayIsInMirrorSet(b) == self.native && (NSInteger)pixelWidth(b) == 2 * self.wanted;
 }
 
 // Every non-zero width is also what Toggle comes back to, however it was chosen (menu, launch or shortcut).
@@ -251,20 +290,21 @@ static OSStatus hotKeyPressed(EventHandlerCallRef next, EventRef event, void *ap
 
 // Makes reality match `wanted`. Safe to call at any time and as often as you like.
 - (void)reconcile {
-  if (!self.wanted || !builtinDisplay()) return [self stopHelper];  // lid closed or display asleep is not an error: a later event retries
-  if (self.helper && [self healthy]) return;
-  if (self.helper && -self.helperStart.timeIntervalSinceNow < 5) return [self reconcileSoon];  // still settling
-  [self stopHelper];
+  if (!self.wanted || !builtinDisplay()) return [self revert];  // lid closed or display asleep is not an error: a later event retries
+  BOOL on = self.helper || self.native;
+  if (on && [self healthy]) return;
+  if (on && -self.started.timeIntervalSinceNow < 5) return [self reconcileSoon];  // still settling
+  [self revert];
   // ponytail: no backoff beyond the 2 s debounce; three quick restarts and it gives up for the session.
   // Restarts only count when they follow each other closely, so sleeping and waking all week is fine.
-  if (-self.helperStart.timeIntervalSinceNow > 120) self.restarts = 0;
+  if (-self.started.timeIntervalSinceNow > 120) self.restarts = 0;
   if (self.restarts >= 3) {
     self.wanted = 0;  // for this session only: the saved width stays
     [self refresh];
     return [self alert:@"HiDPI could not keep the resolution" text:@"The resolution was lost several times after the display changed, so HiDPI went back to Normal."];
   }
   self.restarts++;
-  [self startHelper];
+  [self start];
 }
 
 - (void)reconcileSoon {
@@ -272,11 +312,19 @@ static OSStatus hotKeyPressed(EventHandlerCallRef next, EventRef event, void *ap
   [self performSelector:@selector(reconcile) withObject:nil afterDelay:2];
 }
 
-- (void)startHelper {
-  size_t w = (size_t)self.wanted;
+- (void)start {
+  self.started = NSDate.date;
+  CGDisplayModeRef m = nativeMode((size_t)self.wanted, self.fullHeight);
+  if (m) {
+    CGError e = setMode(m);
+    CGDisplayModeRelease(m);
+    self.native = e == kCGErrorSuccess;
+    if (!self.native) [self failed:[NSString stringWithFormat:@"Display configuration failed (CGError %d).", e]];
+    return;
+  }
   NSTask *t = [NSTask new];
   t.executableURL = NSBundle.mainBundle.executableURL;
-  t.arguments = @[ @"--child", @(w).stringValue, @(heightFor(w, [prefs() boolForKey:@"fullHeight"])).stringValue ];
+  t.arguments = @[ @"--child", @(self.wanted).stringValue ];
   NSPipe *errPipe = [NSPipe pipe];
   t.standardError = errPipe;
   t.terminationHandler = ^(NSTask *done) {
@@ -294,13 +342,12 @@ static OSStatus hotKeyPressed(EventHandlerCallRef next, EventRef event, void *ap
   };
   NSError *e;
   self.helper = t;
-  self.helperStart = NSDate.date;
   if (![t launchAndReturnError:&e]) [self failed:e.localizedDescription];
 }
 
 // The user picked a width (0 = Normal). Applies at once and is remembered.
 - (void)select:(NSInteger)w {
-  if (w != self.wanted) [self stopHelper];
+  if (w != self.wanted) [self revert];
   self.wanted = w;
   [prefs() setInteger:w forKey:@"width"];
   self.restarts = -1;  // a pick's own start is not a restart
@@ -321,7 +368,7 @@ static OSStatus hotKeyPressed(EventHandlerCallRef next, EventRef event, void *ap
 - (void)custom {
   NSAlert *a = [NSAlert new];
   a.messageText = @"Custom width";
-  a.informativeText = @"Width in points, 1024 to 3840. The height follows the Full height setting.";
+  a.informativeText = @"Width in points, 1024 to 3840. Sizes the display has as its own modes use the full height; others are mirrored at 16:10.";
   [a addButtonWithTitle:@"Apply"];
   [a addButtonWithTitle:@"Cancel"];
   NSTextField *f = [[NSTextField alloc] initWithFrame:NSMakeRect(0, 0, 200, 24)];
@@ -333,11 +380,13 @@ static OSStatus hotKeyPressed(EventHandlerCallRef next, EventRef event, void *ap
   if (err) [self alert:@"Custom width" text:err];
 }
 
-- (void)toggleFullHeight {
-  [prefs() setBool:![prefs() boolForKey:@"fullHeight"] forKey:@"fullHeight"];
-  [self stopHelper];  // the health check only looks at width, so restart explicitly
-  self.restarts = -1;
-  [self reconcile];
+// Stored as the opposite, so that full height is the default. It only matters for native sizes:
+// a mirrored picture is always below the notch.
+- (BOOL)fullHeight { return ![prefs() boolForKey:@"belowNotch"]; }
+
+- (void)toggleNotch {
+  [prefs() setBool:self.fullHeight forKey:@"belowNotch"];
+  if (self.native) [self start];  // same width, other height: switch straight to it
   [self refresh];
 }
 
@@ -362,6 +411,7 @@ static OSStatus hotKeyPressed(EventHandlerCallRef next, EventRef event, void *ap
 
 - (void)failed:(NSString *)why {
   self.helper = nil;
+  self.native = NO;
   self.wanted = 0;
   [prefs() setInteger:0 forKey:@"width"];
   [self refresh];
@@ -369,7 +419,7 @@ static OSStatus hotKeyPressed(EventHandlerCallRef next, EventRef event, void *ap
 }
 
 - (void)applicationWillTerminate:(NSNotification *)note {
-  [self stopHelper];
+  [self revert];
 }
 @end
 
@@ -384,9 +434,9 @@ static int cli(int argc, char **argv) {
   BOOL probe = argc > 1 && !strcmp(argv[1], "--probe");
   int a = probe ? 2 : 1;
   size_t w = argc > a ? (size_t)atoi(argv[a]) : 0;
-  size_t h = argc > a + 1 ? (size_t)atoi(argv[a + 1]) : w * 10 / 16;
-  if (w < 1024 || w > 3840 || h < 640 || h > 2600) {
-    fprintf(stderr, "usage: HiDPI [--child] [--probe] <width 1024-3840> [height]\n");
+  size_t h = mirroredHeight(w);
+  if (w < 1024 || w > 3840) {
+    fprintf(stderr, "usage: HiDPI [--child] [--probe] <width 1024-3840>\n");
     return 2;
   }
   static dispatch_source_t parentWatch;  // static so ARC keeps it alive
@@ -428,6 +478,57 @@ static int loginCli(const char *arg) {
   return 0;
 }
 
+// Self-check for the native path: what each menu width would give right now.
+static int listSizes(void) {
+  if (!builtinDisplay()) return fprintf(stderr, "No built-in display found (is the lid closed?).\n"), 1;
+  for (size_t i = 0; i < sizeof kWidths / sizeof *kWidths; i++) {
+    CGDisplayModeRef m = nativeMode(kWidths[i], YES);
+    printf("%zu x %zu  %s\n", kWidths[i], heightFor(kWidths[i], YES), m ? "native" : "mirrored (no native mode; see --override)");
+    CGDisplayModeRelease(m);
+  }
+  return 0;
+}
+
+// Writes a display override that makes the menu widths native 2x sizes of the built-in display, and prints how
+// to install it. macOS builds a display's list of scaled sizes from "scale-resolutions" in such a file and reads
+// it only at startup. Format as in Apple's own files and the display-scale project (github.com/utsavsingh899/display-scale).
+static int writeOverride(NSString *dir) {
+  CGDirectDisplayID b = builtinDisplay();
+  if (!b) return fprintf(stderr, "No built-in display found (is the lid closed?).\n"), 1;
+  size_t nw = 0, nh = 0;  // the panel itself: its largest native-flagged mode (scaled modes can have more pixels)
+  for (id o in modesOf(b)) {
+    CGDisplayModeRef m = (__bridge CGDisplayModeRef)o;
+    if ((CGDisplayModeGetIOFlags(m) & kDisplayModeNativeFlag) && CGDisplayModeGetPixelWidth(m) > nw) { nw = CGDisplayModeGetPixelWidth(m); nh = CGDisplayModeGetPixelHeight(m); }
+  }
+  if (!nw) return fprintf(stderr, "Could not find the panel's native size.\n"), 1;
+  NSString *rel = [NSString stringWithFormat:@"Displays/Contents/Resources/Overrides/DisplayVendorID-%x", CGDisplayVendorNumber(b)];
+  NSString *name = [NSString stringWithFormat:@"DisplayProductID-%x", CGDisplayModelNumber(b)];
+  // Start from Apple's own file for this panel, so nothing it defines is lost if ours replaces it.
+  NSString *apple = [NSString stringWithFormat:@"/System/Library/%@/%@", rel, name];
+  NSMutableDictionary *d = [NSMutableDictionary dictionaryWithContentsOfFile:apple] ?: [NSMutableDictionary dictionary];
+  d[@"DisplayVendorID"] = @(CGDisplayVendorNumber(b));
+  d[@"DisplayProductID"] = @(CGDisplayModelNumber(b));
+  NSMutableArray *list = [NSMutableArray arrayWithArray:d[@"scale-resolutions"] ?: @[]];
+  for (size_t i = 0; i < sizeof kWidths / sizeof *kWidths; i++) {
+    if (kWidths[i] > nw) continue;  // rendered at 2x, and the display scales down by at most 2x
+    // Rendered size: 2x, in the panel's own shape so it includes the strip beside the notch.
+    uint32_t w = htonl((uint32_t)kWidths[i] * 2), h = htonl((uint32_t)lround((double)kWidths[i] * nh / nw) * 2);
+    uint32_t plain[2] = {w, h}, flagged[4] = {w, h, htonl(0x00000009), htonl(0x00200000)};  // the flags mark a HiDPI size
+    for (NSData *e in @[ [NSData dataWithBytes:plain length:8], [NSData dataWithBytes:flagged length:16] ])
+      if (![list containsObject:e]) [list addObject:e];
+  }
+  d[@"scale-resolutions"] = list;
+  NSString *file = [dir stringByAppendingPathComponent:name];
+  [NSFileManager.defaultManager createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+  NSData *xml = [NSPropertyListSerialization dataWithPropertyList:d format:NSPropertyListXMLFormat_v1_0 options:0 error:nil];
+  if (![xml writeToFile:file atomically:YES]) return fprintf(stderr, "Could not write %s\n", file.UTF8String), 1;
+  printf("Wrote %s\n\nInstall (asks for your password), then restart the Mac:\n"
+         "  sudo mkdir -p /Library/%s\n  sudo install -o root -g wheel -m 0644 '%s' /Library/%s/\n\n"
+         "Check after the restart:\n  HiDPI --sizes\n\nUndo, then restart:\n  sudo rm /Library/%s/%s\n",
+         file.UTF8String, rel.UTF8String, file.UTF8String, rel.UTF8String, rel.UTF8String, name.UTF8String);
+  return 0;
+}
+
 // Draws the iconset PNGs off-screen: a dark rounded square with a white display symbol.
 static int writeIcons(NSString *dir) {
   NSImageSymbolConfiguration *white = [NSImageSymbolConfiguration configurationWithPaletteColors:@[ NSColor.whiteColor, [NSColor.whiteColor colorWithAlphaComponent:0.15] ]];
@@ -456,6 +557,8 @@ int main(int argc, char **argv) {
   @autoreleasepool {
     if (argc > 1 && !strcmp(argv[1], "--login")) return loginCli(argv[2]);
     if (argc > 2 && !strcmp(argv[1], "--icon")) return writeIcons(@(argv[2]));
+    if (argc > 1 && !strcmp(argv[1], "--sizes")) return listSizes();
+    if (argc > 2 && !strcmp(argv[1], "--override")) return writeOverride(@(argv[2]));
     if (argc > 1) return cli(argc, argv);
     App *delegate = [App new];
     NSApplication.sharedApplication.delegate = delegate;
