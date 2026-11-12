@@ -1,7 +1,7 @@
 // HiDPI: sharp (2x) scaled resolutions above what macOS offers on the built-in display.
 // Two ways, picked per width:
-//   native:   the display's own 2x mode, if macOS has one. Full height including the strip beside the notch,
-//             no extra process. macOS only has these after the override file is installed (--override).
+//   native:   the display's own 2x mode, if macOS has one. Full height including the area beside the notch
+//             (or 16:10 below it, by the menu's "Full height" switch), no extra process. macOS only has these after the override file is installed (--override).
 //   mirrored: otherwise, a virtual HiDPI display that the built-in screen mirrors. Always 16:10, below the notch.
 //
 // build:  ./build.sh   (makes HiDPI.app and installs it to ~/Applications)
@@ -75,16 +75,17 @@ static NSArray *modesOf(CGDirectDisplayID d) {
 }
 
 // The built-in display's own 2x mode for a width, or NULL if macOS has none (then the width is mirrored).
-// Of several, the tallest (the whole panel, including the strip beside the notch) at the highest refresh rate.
-// The caller releases it.
-static CGDisplayModeRef nativeMode(size_t w) {
+// A notched display has two per width: the whole panel including the area beside the notch (`full`), and a
+// 16:10 one below the notch. Of equals, the highest refresh rate. The caller releases it.
+static CGDisplayModeRef nativeMode(size_t w, BOOL full) {
   CGDirectDisplayID b = builtinDisplay();
   CGDisplayModeRef best = NULL;
   for (id o in b ? modesOf(b) : @[]) {
     CGDisplayModeRef m = (__bridge CGDisplayModeRef)o;
     if (CGDisplayModeGetWidth(m) != w || CGDisplayModeGetPixelWidth(m) != 2 * w) continue;
     size_t h = CGDisplayModeGetHeight(m), bh = best ? CGDisplayModeGetHeight(best) : 0;
-    if (h > bh || (h == bh && CGDisplayModeGetRefreshRate(m) > CGDisplayModeGetRefreshRate(best))) best = m;
+    BOOL better = !best || (full ? h > bh : h < bh);
+    if (better || (h == bh && CGDisplayModeGetRefreshRate(m) > CGDisplayModeGetRefreshRate(best))) best = m;
   }
   return best ? CGDisplayModeRetain(best) : NULL;
 }
@@ -94,8 +95,8 @@ static CGDisplayModeRef nativeMode(size_t w) {
 static size_t mirroredHeight(size_t w) { return w * 10 / 16; }
 
 // The height a pick of this width gives.
-static size_t heightFor(size_t w) {
-  CGDisplayModeRef m = nativeMode(w);
+static size_t heightFor(size_t w, BOOL full) {
+  CGDisplayModeRef m = nativeMode(w, full);
   size_t h = m ? CGDisplayModeGetHeight(m) : mirroredHeight(w);
   CGDisplayModeRelease(m);
   return h;
@@ -205,6 +206,7 @@ static OSStatus hotKeyPressed(EventHandlerCallRef next, EventRef event, void *ap
   self.customItem = [self addTo:menu title:@"" action:@selector(pick:) tag:0];
   [self addTo:menu title:@"Custom…" action:@selector(custom) tag:0];
   [menu addItem:NSMenuItem.separatorItem];
+  [self addTo:menu title:@"Full height (uses the notch area)" action:@selector(toggleNotch) tag:0];
   NSMenuItem *t = [self addTo:menu title:@"Toggle on/off" action:@selector(toggle) tag:0];
   t.keyEquivalent = @"h";
   t.keyEquivalentModifierMask = NSEventModifierFlagControl | NSEventModifierFlagOption | NSEventModifierFlagCommand;
@@ -240,6 +242,7 @@ static OSStatus hotKeyPressed(EventHandlerCallRef next, EventRef event, void *ap
 // Titles, ticks and the status item all follow from the state, so every change just calls this.
 - (void)refresh {
   NSInteger custom = [prefs() integerForKey:@"customWidth"];
+  BOOL full = self.fullHeight;
   BOOL preset = NO;
   for (size_t i = 0; i < sizeof kWidths / sizeof *kWidths; i++) preset |= (NSInteger)kWidths[i] == custom;
   self.customItem.tag = custom;
@@ -247,8 +250,10 @@ static OSStatus hotKeyPressed(EventHandlerCallRef next, EventRef event, void *ap
   for (NSMenuItem *i in self.item.menu.itemArray) {
     if (i.action == @selector(pick:)) {
       size_t w = (size_t)i.tag;
-      if (w) i.title = [NSString stringWithFormat:@"%@%zu × %zu", i == self.customItem ? @"Custom: " : @"", w, heightFor(w)];
+      if (w) i.title = [NSString stringWithFormat:@"%@%zu × %zu", i == self.customItem ? @"Custom: " : @"", w, heightFor(w, full)];
       i.state = (NSInteger)w == self.wanted && !i.hidden;
+    } else if (i.action == @selector(toggleNotch)) {
+      i.state = full;
     } else if (i.action == @selector(toggleLogin)) {
       i.state = [SMAppService mainAppService].status == SMAppServiceStatusEnabled;
     }
@@ -309,7 +314,7 @@ static OSStatus hotKeyPressed(EventHandlerCallRef next, EventRef event, void *ap
 
 - (void)start {
   self.started = NSDate.date;
-  CGDisplayModeRef m = nativeMode((size_t)self.wanted);
+  CGDisplayModeRef m = nativeMode((size_t)self.wanted, self.fullHeight);
   if (m) {
     CGError e = setMode(m);
     CGDisplayModeRelease(m);
@@ -373,6 +378,16 @@ static OSStatus hotKeyPressed(EventHandlerCallRef next, EventRef event, void *ap
   if ([a runModal] != NSAlertFirstButtonReturn) return;
   NSString *err = [self useCustomWidth:f.stringValue.integerValue];
   if (err) [self alert:@"Custom width" text:err];
+}
+
+// Stored as the opposite, so that full height is the default. It only matters for native sizes:
+// a mirrored picture is always below the notch.
+- (BOOL)fullHeight { return ![prefs() boolForKey:@"belowNotch"]; }
+
+- (void)toggleNotch {
+  [prefs() setBool:self.fullHeight forKey:@"belowNotch"];
+  if (self.native) [self start];  // same width, other height: switch straight to it
+  [self refresh];
 }
 
 - (void)toggle {
@@ -467,8 +482,8 @@ static int loginCli(const char *arg) {
 static int listSizes(void) {
   if (!builtinDisplay()) return fprintf(stderr, "No built-in display found (is the lid closed?).\n"), 1;
   for (size_t i = 0; i < sizeof kWidths / sizeof *kWidths; i++) {
-    CGDisplayModeRef m = nativeMode(kWidths[i]);
-    printf("%zu x %zu  %s\n", kWidths[i], heightFor(kWidths[i]), m ? "native" : "mirrored (no native mode; see --override)");
+    CGDisplayModeRef m = nativeMode(kWidths[i], YES);
+    printf("%zu x %zu  %s\n", kWidths[i], heightFor(kWidths[i], YES), m ? "native" : "mirrored (no native mode; see --override)");
     CGDisplayModeRelease(m);
   }
   return 0;

@@ -13,7 +13,7 @@ It does this in one of two ways, chosen per size:
 | | Native | Mirrored |
 |---|---|---|
 | How | The display's own 2x mode | A virtual 2x display that the built-in screen mirrors |
-| Height | Full panel, including the strip beside the notch | 16:10, below the notch |
+| Height | Full panel including the area beside the notch, or 16:10 below it (your choice) | 16:10, below the notch |
 | Needs | The override file installed once (see below) | Nothing |
 | Extra process | None | One helper while the size is active |
 
@@ -66,8 +66,9 @@ Click the display icon in the menu bar.
 | Menu item | What it does |
 |---|---|
 | Normal | Back to the resolution set in System Settings |
-| 1920, 2048, 2294 and 2560 wide | Switch to that size at 2x. The menu shows the height: full height when native, 16:10 when mirrored |
+| 1920, 2048, 2294 and 2560 wide | Switch to that size at 2x. The menu shows the height it will give |
 | Custom… | Any width from 1024 to 3840, saved as its own menu entry. Mirrored unless the display has that width as a native mode |
+| Full height (uses the notch area) | On by default. On: native sizes use the whole panel, with the menu bar beside the notch (for example 2294 × 1490). Off: they stay 16:10 below the notch (2294 × 1433). Mirrored sizes are always below the notch |
 | Toggle on/off | Switch between Normal and the last size. Also on Control+Option+Command+H |
 | Start at login | Open HiDPI automatically when you log in |
 | Quit HiDPI | Back to Normal and close the app |
@@ -101,7 +102,7 @@ Everything is in one file, `hidpi.m`.
 ## Limits
 
 - **Sharpness:** the panel has a fixed number of pixels. Sizes above the native 2x size are scaled down, so they are sharper than the 1x modes but softer than the default resolution. The larger the size, the softer it gets.
-- **Notch strip:** only native sizes use it. A virtual display has no notch, and macOS shows a mirrored picture in the 16:10 area below it.
+- **Notch area:** only native sizes can use it. A virtual display has no notch, and macOS shows a mirrored picture in the 16:10 area below it.
 - **Custom widths:** mirrored, unless you add them to the override file yourself.
 - **Private API:** mirroring uses `CGVirtualDisplay`, which is undocumented and may change in a macOS update. Run `--probe` to check, and rebuild after updating. Native sizes do not use it.
 - **Untested:** HDR content, external monitors, and sleep by closing the lid (display sleep is tested).
